@@ -40,7 +40,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 /// Filter Next.js build output - extract routes, bundles, warnings
-fn filter_next_build(output: &str) -> String {
+pub(crate) fn filter_next_build(output: &str) -> String {
     // Bundle size pattern
     static BUNDLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"^[○●◐λ✓]\s+([\w/\-\.]+)\s+(\d+(?:\.\d+)?)\s*(kB|B)\s+(\d+(?:\.\d+)?)\s*(kB|B)")

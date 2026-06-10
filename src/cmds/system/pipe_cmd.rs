@@ -35,8 +35,42 @@ pub fn resolve_filter(name: &str) -> Option<fn(&str) -> String> {
         "ecs" => Some(crate::cmds::php::ecs_cmd::filter_ecs_output),
         "phpstan" => Some(phpstan_wrapper),
         "pint" => Some(pint_wrapper),
+        "jest" => Some(vitest_wrapper), // VitestParser auto-detects the jest framework
+        "eslint" => Some(eslint_wrapper),
+        "biome" => Some(biome_wrapper),
+        "playwright" => Some(playwright_wrapper),
+        "next" => Some(next_wrapper),
+        "kubectl" | "k8s" => Some(crate::cmds::cloud::container::filter_kubectl_pipe),
         _ => None,
     }
+}
+
+// eslint: JSON when piped from `eslint -f json`, else the default stylish text.
+fn eslint_wrapper(input: &str) -> String {
+    if input.trim_start().starts_with('[') {
+        crate::cmds::js::lint_cmd::filter_eslint_json(input)
+    } else {
+        crate::cmds::js::lint_cmd::filter_generic_lint(input)
+    }
+}
+
+// biome has no dedicated JSON parser; its default text output groups fine here.
+fn biome_wrapper(input: &str) -> String {
+    crate::cmds::js::lint_cmd::filter_generic_lint(input)
+}
+
+fn playwright_wrapper(input: &str) -> String {
+    use crate::cmds::js::playwright_cmd::PlaywrightParser;
+    use crate::parser::{FormatMode, OutputParser, TokenFormatter};
+    match PlaywrightParser::parse(input) {
+        crate::parser::ParseResult::Full(data) => data.format(FormatMode::Compact),
+        crate::parser::ParseResult::Degraded(data, _) => data.format(FormatMode::Compact),
+        crate::parser::ParseResult::Passthrough(raw) => raw,
+    }
+}
+
+fn next_wrapper(input: &str) -> String {
+    crate::cmds::js::next_cmd::filter_next_build(input)
 }
 
 fn go_test_wrapper(input: &str) -> String {
@@ -268,9 +302,10 @@ pub fn run(filter_name: Option<&str>, passthrough: bool) -> Result<()> {
         Some(name) => resolve_filter(name).ok_or_else(|| {
             anyhow::anyhow!(
                 "Unknown filter '{}'. Available: cargo-test, pytest, go-test, go-build, \
-                 ctest, tsc, vitest, grep, rg, find, fd, git-log, git-diff, git-status, \
+                 ctest, tsc, vitest, jest, grep, rg, find, fd, git-log, git-diff, git-status, \
                  log, mypy, ruff-check, ruff-format, prettier, phpunit, pest, \
-                 paratest, php-test, ecs, phpstan, pint",
+                 paratest, php-test, ecs, phpstan, pint, eslint, biome, playwright, \
+                 next, kubectl",
                 name
             )
         })?,

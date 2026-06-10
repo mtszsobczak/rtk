@@ -232,7 +232,7 @@ pub fn run(runner: Option<&str>, args: &[String], verbose: u8) -> Result<i32> {
 }
 
 /// Filter ESLint JSON output - group by rule and file
-fn filter_eslint_json(output: &str) -> String {
+pub(crate) fn filter_eslint_json(output: &str) -> String {
     let results: Result<Vec<EslintResult>, _> = serde_json::from_str(output);
 
     let results = match results {
@@ -458,7 +458,7 @@ fn filter_pylint_json(output: &str) -> String {
 }
 
 /// Filter generic linter output (fallback for non-ESLint linters)
-fn filter_generic_lint(output: &str) -> String {
+pub(crate) fn filter_generic_lint(output: &str) -> String {
     let mut warnings = 0;
     let mut errors = 0;
     let mut issues: Vec<String> = Vec::new();

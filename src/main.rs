@@ -1529,8 +1529,19 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
                     stdout_raw.to_string()
                 };
                 let success = output.status.success();
-                let (filtered, loss) =
-                    core::toml_filter::apply_filter_with_info(filter, &combined_raw);
+                // For wrapper recipes (`just`) the real tool is hidden from the
+                // hook, so sniff the captured output and apply the inner tool's
+                // specialized filter when recognizable; otherwise fall back to
+                // the matched TOML filter (generic line cap).
+                let classified = if filter.name == "just" {
+                    core::classify::classify_and_filter(&combined_raw)
+                } else {
+                    None
+                };
+                let (filtered, loss) = match classified {
+                    Some(filtered) => (filtered, core::toml_filter::Lossiness::None),
+                    None => core::toml_filter::apply_filter_with_info(filter, &combined_raw),
+                };
                 let lossy = !matches!(loss, core::toml_filter::Lossiness::None);
 
                 let hint = if !success {

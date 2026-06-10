@@ -814,6 +814,18 @@ pub const RULES: &[RtkRule] = &[
         ..RtkRule::DEFAULT
     },
     RtkRule {
+        // Local patch: route `just` through the existing just.toml filter
+        // (strips recipe headers, caps lines). Upstream ships the filter but
+        // no RULES entry, so the hook never rewrites it. High-value here:
+        // `just compile`/`just typecheck`/`just test-quick` are heavily used.
+        pattern: r"^just\b",
+        rtk_cmd: "rtk just",
+        rewrite_prefixes: &["just"],
+        category: "Build",
+        savings_pct: 50.0,
+        ..RtkRule::DEFAULT
+    },
+    RtkRule {
         pattern: r"^make\b",
         rtk_cmd: "rtk make",
         rewrite_prefixes: &["make"],

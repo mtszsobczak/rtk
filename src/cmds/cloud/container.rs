@@ -772,8 +772,8 @@ pub fn run_kubectl_get(args: &[String], verbose: u8) -> Result<i32> {
 
 fn run_k8s_get(tool: &str, args: &[String], verbose: u8) -> Result<i32> {
     match k8s_get_target(args) {
-        Some(("pods", rest)) => k8s_pods(tool, rest, verbose),
-        Some(("services", rest)) => k8s_services(tool, rest, verbose),
+        Some(("pods", rest)) => k8s_pods(tool, &rest, verbose),
+        Some(("services", rest)) => k8s_services(tool, &rest, verbose),
         _ => {
             let passthrough_args: Vec<OsString> = std::iter::once(OsString::from("get"))
                 .chain(args.iter().map(|arg| OsString::from(arg.as_str())))
@@ -783,18 +783,44 @@ fn run_k8s_get(tool: &str, args: &[String], verbose: u8) -> Result<i32> {
     }
 }
 
-fn k8s_get_target(args: &[String]) -> Option<(&'static str, &[String])> {
-    let resource = args.first()?.as_str();
-    let rest = &args[1..];
-    if k8s_get_requests_raw_output(rest) {
+fn k8s_get_target(args: &[String]) -> Option<(&'static str, Vec<String>)> {
+    if k8s_get_requests_raw_output(args) {
         return None;
     }
-
-    match resource {
-        "po" | "pod" | "pods" => Some(("pods", rest)),
-        "svc" | "service" | "services" => Some(("services", rest)),
-        _ => None,
-    }
+    // Flags that consume the FOLLOWING token as their value, so we don't mistake
+    // that value for the resource. `--flag=value` forms consume nothing extra.
+    const VALUE_FLAGS: &[&str] = &[
+        "-n", "--namespace", "--context", "--kubeconfig", "-l", "--selector", "--as",
+        "--as-group", "--field-selector",
+    ];
+    // Resource = first non-flag token, skipping any leading flags (and their values),
+    // so `kubectl get -n foo pods` / `... --context prod pods` still match.
+    let mut idx = 0;
+    let resource_pos = loop {
+        let a = args.get(idx)?.as_str();
+        if a.starts_with('-') {
+            if !a.contains('=') && VALUE_FLAGS.contains(&a) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        break idx;
+    };
+    let target = match args[resource_pos].as_str() {
+        "po" | "pod" | "pods" => "pods",
+        "svc" | "service" | "services" => "services",
+        _ => return None,
+    };
+    // Forward every arg except the matched resource token (flags preserved).
+    let rest: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != resource_pos)
+        .map(|(_, s)| s.clone())
+        .collect();
+    Some((target, rest))
 }
 
 fn k8s_get_requests_raw_output(args: &[String]) -> bool {
@@ -817,6 +843,60 @@ pub fn run_oc_get(args: &[String], verbose: u8) -> Result<i32> {
 
 pub fn run_oc_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
     crate::core::runner::run_passthrough("oc", args, verbose)
+}
+
+/// Pipe-mode filter for captured `kubectl` output. Handles `-o json` (reusing
+/// the pod/service formatters) and the default text table (row cap + truncate).
+/// Useful when kubectl runs behind a wrapper the hook can't see, e.g.
+/// `ssh host "kubectl get pods" | rtk pipe -f kubectl`.
+pub fn filter_kubectl_pipe(input: &str) -> String {
+    let trimmed = input.trim_start();
+    if trimmed.starts_with('{') {
+        if let Ok(json) = serde_json::from_str::<Value>(trimmed) {
+            let kind = json["items"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|i| i["kind"].as_str())
+                .or_else(|| json["kind"].as_str())
+                .unwrap_or("");
+            return match kind {
+                "Pod" => format_kubectl_pods(&json),
+                "Service" => format_kubectl_services(&json),
+                _ => compact_kubectl_table(input),
+            };
+        }
+    }
+    compact_kubectl_table(input)
+}
+
+/// Cap a wide/long `kubectl get` text table: keep header + first N rows,
+/// truncate over-long lines, and report how many rows were dropped.
+fn compact_kubectl_table(input: &str) -> String {
+    const MAX_ROWS: usize = 40;
+    const MAX_WIDTH: usize = 160;
+    let lines: Vec<&str> = input.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return "kubectl: no output".to_string();
+    }
+    let data_rows = lines.len().saturating_sub(1);
+    let mut out = String::new();
+    for line in lines.iter().take(MAX_ROWS + 1) {
+        out.push_str(&kube_trunc(line, MAX_WIDTH));
+        out.push('\n');
+    }
+    if data_rows > MAX_ROWS {
+        out.push_str(&format!("… +{} more rows\n", data_rows - MAX_ROWS));
+    }
+    out.trim_end().to_string()
+}
+
+fn kube_trunc(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(n).collect();
+        format!("{head}…")
+    }
 }
 
 #[cfg(test)]
@@ -963,7 +1043,7 @@ api-1  | Connected to database";
 
             assert_eq!(
                 k8s_get_target(&args),
-                Some(("pods", &args[1..])),
+                Some(("pods", args[1..].to_vec())),
                 "failed for {resource}"
             );
         }
@@ -976,10 +1056,35 @@ api-1  | Connected to database";
 
             assert_eq!(
                 k8s_get_target(&args),
-                Some(("services", &args[1..])),
+                Some(("services", args[1..].to_vec())),
                 "failed for {resource}"
             );
         }
+    }
+
+    #[test]
+    fn test_k8s_get_target_flags_before_resource() {
+        // Flags (and their values) before the resource must be skipped, and
+        // forwarded back in `rest` so the eventual kubectl call still sees them.
+        let args = vec![
+            "--context".to_string(),
+            "prod".to_string(),
+            "-n".to_string(),
+            "app".to_string(),
+            "pods".to_string(),
+        ];
+        assert_eq!(
+            k8s_get_target(&args),
+            Some((
+                "pods",
+                vec![
+                    "--context".to_string(),
+                    "prod".to_string(),
+                    "-n".to_string(),
+                    "app".to_string(),
+                ]
+            ))
+        );
     }
 
     #[test]

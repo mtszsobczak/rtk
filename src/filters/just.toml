@@ -1,6 +1,9 @@
 [filters.just]
 description = "Compact just task runner output — strip recipe headers, keep command output"
 match_command = "^just\\b"
+# Capture stderr too: recipes run the real tool (tsc/mypy/pytest/…) often via
+# docker, and the output classifier needs the full stream to detect the tool.
+filter_stderr = true
 strip_ansi = true
 strip_lines_matching = [
   "^\\s*$",
