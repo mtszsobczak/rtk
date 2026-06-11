@@ -11,7 +11,11 @@ strip_lines_matching = [
   "^\\s*just --list",
 ]
 truncate_lines_at = 150
-max_lines = 50
+# Fallback for recipes with no classify signature: keep the head for context and
+# the tail for the verdict. Test runners / builds put pass-fail and error
+# summaries at the bottom, so a head-only cap drops exactly what matters.
+head_lines = 20
+tail_lines = 30
 
 [[tests.just]]
 name = "preserves command output"

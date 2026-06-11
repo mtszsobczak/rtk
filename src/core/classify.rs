@@ -17,6 +17,11 @@ pub fn classify_and_filter(output: &str) -> Option<String> {
         return Some(cmds::js::tsc_cmd::filter_tsc_output(output));
     }
 
+    // Emacs ERT batch — "Ran N tests, M results as expected" is ERT-unique.
+    if output.contains("results as expected") {
+        return Some(cmds::emacs::ert_cmd::filter_ert_output(output));
+    }
+
     // Vitest — run banner / summary line.
     if output.contains("Test Files ") || output.contains("RUN  v") {
         return Some(vitest_filter(output));

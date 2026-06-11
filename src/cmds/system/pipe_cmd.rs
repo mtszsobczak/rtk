@@ -13,6 +13,7 @@ pub fn resolve_filter(name: &str) -> Option<fn(&str) -> String> {
     match name {
         "cargo-test" | "cargo" => Some(crate::cmds::rust::cargo_cmd::filter_cargo_test),
         "pytest" => Some(crate::cmds::python::pytest_cmd::filter_pytest_output),
+        "ert" => Some(crate::cmds::emacs::ert_cmd::filter_ert_output),
         "go-test" => Some(go_test_wrapper),
         "go-build" => Some(crate::cmds::go::go_cmd::filter_go_build),
         "ctest" => Some(crate::cmds::system::ctest_cmd::filter_ctest_output),
@@ -301,7 +302,7 @@ pub fn run(filter_name: Option<&str>, passthrough: bool) -> Result<()> {
     let filter_fn = match filter_name {
         Some(name) => resolve_filter(name).ok_or_else(|| {
             anyhow::anyhow!(
-                "Unknown filter '{}'. Available: cargo-test, pytest, go-test, go-build, \
+                "Unknown filter '{}'. Available: cargo-test, pytest, ert, go-test, go-build, \
                  ctest, tsc, vitest, jest, grep, rg, find, fd, git-log, git-diff, git-status, \
                  log, mypy, ruff-check, ruff-format, prettier, phpunit, pest, \
                  paratest, php-test, ecs, phpstan, pint, eslint, biome, playwright, \
