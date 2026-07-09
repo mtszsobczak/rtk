@@ -14,7 +14,13 @@ use crate::cmds;
 pub fn classify_and_filter(output: &str) -> Option<String> {
     // TypeScript compiler — "error TS2322" etc.
     if output.contains("error TS") {
-        return Some(cmds::js::tsc_cmd::filter_tsc_output(output));
+        let filtered = cmds::js::tsc_cmd::filter_tsc_output(output);
+        // The formatter returns this success-like message when none of its
+        // canonical diagnostics parsed. Do not let a loose signature hide a
+        // failing wrapped command; fall back to the generic `just` filter.
+        if filtered != "TypeScript compilation completed" {
+            return Some(filtered);
+        }
     }
 
     // Emacs ERT batch — "Ran N tests, M results as expected" is ERT-unique.
@@ -58,5 +64,30 @@ fn vitest_filter(input: &str) -> String {
         crate::parser::ParseResult::Full(d) => d.format(FormatMode::Compact),
         crate::parser::ParseResult::Degraded(d, _) => d.format(FormatMode::Compact),
         crate::parser::ParseResult::Passthrough(raw) => raw,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unparseable_typescript_error_falls_back() {
+        // Carries the `error TS` signature but matches none of the three
+        // diagnostic forms tsc_cmd knows: the code is not followed by a colon,
+        // so neither the `file(l,c):` nor the `file:l:c -` nor the global
+        // `error TSxxxx:` pattern applies.
+        let output = "src/main.ts:4:1 - error TS2322 Type string is not assignable to number.";
+
+        assert_eq!(classify_and_filter(output), None);
+    }
+
+    #[test]
+    fn canonical_typescript_error_uses_specialized_filter() {
+        let output = "src/main.ts(4,1): error TS2322: Type string is not assignable to number.";
+
+        let filtered = classify_and_filter(output).expect("canonical tsc output should classify");
+        assert!(filtered.contains("TS2322"));
+        assert!(filtered.contains("main.ts"));
     }
 }
