@@ -782,6 +782,165 @@ fn run_claude_inner(input: &str) -> Option<String> {
     }
 }
 
+// ── Codex CLI native hook ──────────────────────────────────────
+
+/// Codex's `shell` tool sends `tool_input.command` as an argv array,
+/// typically `["/bin/bash", "-lc", "<script>"]`. Return the index of the
+/// script element so it can be rewritten in place, preserving argv shape.
+fn codex_script_index(argv: &[Value]) -> Option<usize> {
+    let flag = argv
+        .iter()
+        .position(|a| matches!(a.as_str(), Some("-lc") | Some("-c") | Some("-lic")))?;
+    let idx = flag + 1;
+    (idx < argv.len() && argv[idx].as_str().is_some()).then_some(idx)
+}
+
+/// Codex speaks the same PreToolUse wire format as Claude Code
+/// (`hookSpecificOutput` + `updatedInput`, gated on
+/// `permissionDecision: "allow"`). The only difference is that the shell
+/// tool passes an argv array where Claude Code passes a string.
+fn process_codex_payload(v: &Value) -> PayloadAction {
+    let ti = match v.get("tool_input") {
+        Some(t) => t,
+        None => return PayloadAction::Ignore,
+    };
+
+    let (cmd, argv_idx) = match ti.get("command") {
+        Some(Value::String(s)) if !s.is_empty() => (s.clone(), None),
+        Some(Value::Array(argv)) => match codex_script_index(argv) {
+            Some(i) => (argv[i].as_str().unwrap_or_default().to_string(), Some(i)),
+            None => return PayloadAction::Ignore,
+        },
+        _ => return PayloadAction::Ignore,
+    };
+
+    if cmd.is_empty() {
+        return PayloadAction::Ignore;
+    }
+
+    // Codex rejects `updatedInput` unless it is paired with
+    // `permissionDecision: "allow"`, so unlike Claude Code there is no way to
+    // express "rewrite this, but still ask". An AskRewrite therefore has to
+    // pass through unrewritten and let Codex's own permission flow handle it.
+    let rewritten = match decide_hook_action(&cmd, permissions::Host::Claude) {
+        HookDecision::Deny => {
+            return PayloadAction::Skip {
+                decision: HookOutcome::Deny,
+                cmd,
+            }
+        }
+        HookDecision::Defer => {
+            return PayloadAction::Skip {
+                decision: HookOutcome::Defer,
+                cmd,
+            }
+        }
+        HookDecision::AskRewrite { .. } => {
+            return PayloadAction::Skip {
+                decision: HookOutcome::Ask,
+                cmd,
+            }
+        }
+        HookDecision::AllowRewrite(r) => r,
+    };
+
+    let output = codex_rewrite_payload(ti, argv_idx, &rewritten);
+
+    PayloadAction::Rewrite {
+        cmd,
+        rewritten,
+        decision: HookOutcome::Allow,
+        output,
+    }
+}
+
+/// Build the Codex PreToolUse response for a rewritten command, preserving the
+/// original `tool_input` shape (argv array or plain string) and every sibling
+/// field. `permissionDecision: "allow"` is mandatory whenever `updatedInput` is
+/// present — Codex rejects the payload otherwise.
+fn codex_rewrite_payload(ti: &Value, argv_idx: Option<usize>, rewritten: &str) -> Value {
+    let mut updated_input = ti.clone();
+    match argv_idx {
+        Some(i) => {
+            if let Some(argv) = updated_input
+                .get_mut("command")
+                .and_then(|c| c.as_array_mut())
+            {
+                argv[i] = Value::String(rewritten.to_string());
+            }
+        }
+        None => {
+            if let Some(obj) = updated_input.as_object_mut() {
+                obj.insert("command".into(), Value::String(rewritten.to_string()));
+            }
+        }
+    }
+
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": PRE_TOOL_USE_KEY,
+            "permissionDecision": "allow",
+            "permissionDecisionReason": "RTK auto-rewrite",
+            "updatedInput": updated_input
+        }
+    })
+}
+
+/// Run the Codex CLI pre_tool_use hook natively.
+pub fn run_codex() -> Result<()> {
+    let input = read_stdin_limited()?;
+
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(());
+    }
+
+    let v: Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON input: {e}");
+            return Ok(());
+        }
+    };
+
+    match process_codex_payload(&v) {
+        PayloadAction::Rewrite {
+            cmd,
+            rewritten,
+            output,
+            ..
+        } => {
+            audit_log("rewrite", &cmd, &rewritten);
+            let _ = writeln!(io::stdout(), "{output}");
+        }
+        PayloadAction::Skip { decision, cmd } => {
+            // Codex reaches Skip on Ask as well as Deny/Defer, because
+            // `updatedInput` is only accepted alongside
+            // `permissionDecision: "allow"` — so an Ask cannot be rewritten and
+            // gets its own reason in `rtk hook audit`'s skip breakdown.
+            let audit_action = match decision {
+                HookOutcome::Deny => "skip:deny_rule",
+                HookOutcome::Defer => "skip:defer",
+                HookOutcome::Ask => "skip:ask_not_expressible",
+                HookOutcome::Allow => "skip",
+            };
+            audit_log(audit_action, &cmd, "");
+        }
+        PayloadAction::Ignore => {}
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+fn run_codex_inner(input: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(input).ok()?;
+    match process_codex_payload(&v) {
+        PayloadAction::Rewrite { output, .. } => Some(output.to_string()),
+        _ => None,
+    }
+}
+
 // ── Cursor native hook ─────────────────────────────────────────
 
 /// Run the Cursor Agent hook natively.
@@ -1670,6 +1829,78 @@ mod tests {
     #[test]
     fn test_claude_passthrough_no_output() {
         assert!(run_claude_inner(&claude_input("htop")).is_none());
+    }
+
+    fn codex_argv_input(cmd: &str) -> String {
+        json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "shell",
+            "tool_input": { "command": ["/bin/bash", "-lc", cmd], "timeout_ms": 5000 }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_codex_script_index_finds_shell_payload() {
+        let argv = json!(["/bin/bash", "-lc", "git status"]);
+        assert_eq!(codex_script_index(argv.as_array().unwrap()), Some(2));
+        let bare = json!(["ls", "-la"]);
+        assert_eq!(codex_script_index(bare.as_array().unwrap()), None);
+        let dangling = json!(["/bin/bash", "-lc"]);
+        assert_eq!(codex_script_index(dangling.as_array().unwrap()), None);
+    }
+
+    #[test]
+    fn test_codex_argv_rewrite_preserves_shape() {
+        let ti = json!({ "command": ["/bin/bash", "-lc", "git status"], "timeout_ms": 5000 });
+        let v = codex_rewrite_payload(&ti, Some(2), "rtk git status");
+        let updated = &v["hookSpecificOutput"]["updatedInput"];
+        // argv shape and sibling fields survive; only the script element changes
+        assert_eq!(updated["command"][0], "/bin/bash");
+        assert_eq!(updated["command"][1], "-lc");
+        assert_eq!(updated["command"][2], "rtk git status");
+        assert_eq!(updated["timeout_ms"], 5000);
+    }
+
+    #[test]
+    fn test_codex_rewrite_always_carries_allow_decision() {
+        // Codex rejects updatedInput unless permissionDecision is "allow",
+        // so the builder must emit it unconditionally.
+        let ti = json!({ "command": ["/bin/bash", "-lc", "git status"] });
+        let v = codex_rewrite_payload(&ti, Some(2), "rtk git status");
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    }
+
+    #[test]
+    fn test_codex_string_command_rewrite() {
+        let ti = json!({ "command": "git status", "timeout_ms": 5000 });
+        let v = codex_rewrite_payload(&ti, None, "rtk git status");
+        let updated = &v["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(updated["command"], "rtk git status");
+        assert_eq!(updated["timeout_ms"], 5000);
+    }
+
+    #[test]
+    fn test_codex_passthrough_no_output() {
+        assert!(run_codex_inner(&codex_argv_input("htop")).is_none());
+    }
+
+    #[test]
+    fn test_codex_bare_argv_ignored() {
+        // No -c/-lc flag means no script element to rewrite; leave it alone.
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "shell",
+            "tool_input": { "command": ["ls", "-la"] }
+        })
+        .to_string();
+        assert!(run_codex_inner(&input).is_none());
+    }
+
+    #[test]
+    fn test_codex_substitution_not_rewritten() {
+        assert!(run_codex_inner(&codex_argv_input("git status $(rm -rf /tmp/x)")).is_none());
     }
 
     #[test]
